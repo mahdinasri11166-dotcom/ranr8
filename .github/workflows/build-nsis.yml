@@ -219,6 +219,7 @@ jobs:
           Expand-Archive -Path $zipPath -DestinationPath $offline -Force
 
           $pth = Get-ChildItem $offline -Filter "python*._pth" | Select-Object -First 1
+          if (-not $pth) { throw "python38 ._pth missing" }
           Set-Content $pth.FullName -Encoding ASCII -Value @("python38.zip",".","DLLs","Lib","Lib\site-packages","import site")
 
           $py = Join-Path $offline "python.exe"
@@ -234,33 +235,73 @@ jobs:
             & $py -m pip install llama-cpp-python --no-warn-script-location
           }
 
-          choco install python38 -y --no-progress
-          $sysPy = Join-Path $env:ProgramFiles "Python38\python.exe"
-          if (Test-Path $sysPy) {
-            $sysPrefix = (& $sysPy -c "import sys; print(sys.base_prefix)").Trim()
-            New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs") | Out-Null
-            foreach ($rel in @("Lib\tkinter","tcl\tcl8.6","tcl\tk8.6")) {
-              $src = Join-Path $sysPrefix $rel
-              if (Test-Path $src) {
-                $dst = Join-Path $offline $rel
-                New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-                Copy-Item -Recurse -Force $src $dst
-              }
+          # ---- Locate a full Python 3.8 install that HAS tkinter ----
+          choco install python38 -y --no-progress --ignore-checksums
+          $candidates = @(
+            (Join-Path $env:ProgramFiles "Python38\python.exe"),
+            (Join-Path $env:SystemDrive "Python38\python.exe"),
+            (Join-Path $env:ProgramFiles "Python38-32\python.exe")
+          )
+          $sysPy = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sysPy) {
+            $pyLauncher = (Get-Command py -ErrorAction SilentlyContinue).Source
+            if ($pyLauncher) {
+              $cand = & $pyLauncher -3.8 -c "import sys; print(sys.executable)" 2>$null
+              if ($cand -and (Test-Path $cand.Trim())) { $sysPy = $cand.Trim() }
             }
-            $sysDll = Join-Path $sysPrefix "DLLs"
-            $dllOut = Join-Path $offline "DLLs"
-            foreach ($name in @("_tkinter.pyd","tcl86t.dll","tk86t.dll","zlib1.dll")) {
-              $src = Join-Path $sysDll $name
-              if (Test-Path $src) {
-                Copy-Item -Force $src (Join-Path $dllOut $name)
-                Copy-Item -Force $src (Join-Path $offline $name)
-              }
-            }
-            $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
-            $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
-            $env:PATH = "$offline;$dllOut;" + $env:PATH
-            & $py -c "import tkinter; print('py38 tkinter OK')"
           }
+          if (-not $sysPy) {
+            Write-Host "Downloading official Python 3.8.10 installer..."
+            $inst = Join-Path $payload "python-3.8.10-amd64.exe"
+            Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.8.10/python-3.8.10-amd64.exe" -OutFile $inst -UseBasicParsing -TimeoutSec 300
+            $targetDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python38"
+            Start-Process -FilePath $inst -ArgumentList "/quiet","InstallAllUsers=0","PrependPath=0","Include_test=0","Include_tcltk=1","TargetDir=$targetDir" -Wait
+            $sysPy = Join-Path $targetDir "python.exe"
+          }
+          if (-not (Test-Path $sysPy)) { throw "Could not locate a full Python 3.8 with tkinter" }
+
+          $sysPrefix = (& $sysPy -c "import sys; print(sys.base_prefix)").Trim()
+          Write-Host "py38 sysPrefix=$sysPrefix"
+          $tkSrc = Join-Path $sysPrefix "Lib\tkinter"
+          if (-not (Test-Path $tkSrc)) {
+            throw "Python 3.8 at $sysPrefix has no tkinter (install lacked Tcl/Tk). Tried: $sysPy"
+          }
+
+          New-Item -ItemType Directory -Force -Path (Join-Path $offline "DLLs"), (Join-Path $offline "Lib"), (Join-Path $offline "tcl") | Out-Null
+          foreach ($rel in @("Lib\tkinter","tcl\tcl8.6","tcl\tk8.6")) {
+            $src = Join-Path $sysPrefix $rel
+            if (Test-Path $src) {
+              $dst = Join-Path $offline $rel
+              New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+              Copy-Item -Recurse -Force $src $dst
+            } else {
+              Write-Host "WARN missing in sysPy: $rel"
+            }
+          }
+
+          $sysDll = Join-Path $sysPrefix "DLLs"
+          $dllOut = Join-Path $offline "DLLs"
+          foreach ($name in @("_tkinter.pyd","tcl86t.dll","tk86t.dll","zlib1.dll")) {
+            $src = Join-Path $sysDll $name
+            if (Test-Path $src) {
+              Copy-Item -Force $src (Join-Path $dllOut $name)
+              Copy-Item -Force $src (Join-Path $offline $name)
+            } else {
+              Write-Host "WARN missing DLL: $name"
+            }
+          }
+          foreach ($pat in @("tcl*.dll","tk*.dll","_tkinter*")) {
+            Get-ChildItem $sysDll -Filter $pat -EA SilentlyContinue | ForEach-Object {
+              Copy-Item -Force $_.FullName $dllOut
+              Copy-Item -Force $_.FullName $offline
+            }
+          }
+
+          $env:TCL_LIBRARY = Join-Path $offline "tcl\tcl8.6"
+          $env:TK_LIBRARY = Join-Path $offline "tcl\tk8.6"
+          $env:PATH = "$offline;$dllOut;" + $env:PATH
+          & $py -c "import tkinter; print('py38 tkinter OK')"
+          if ($LASTEXITCODE -ne 0) { throw "py38 tkinter still missing after injection" }
 
           $srcPy = Join-Path $PWD "scripts\python"
           Copy-Item -Force (Join-Path $srcPy "*.py") $offline
@@ -269,7 +310,6 @@ jobs:
           Copy-Item -Force (Join-Path $srcPy "*.py") $sd
 
           # Strict verification: customtkinter MUST import
-          $py = Join-Path $offline "python.exe"
           & $py -c "import customtkinter; print('ctk38 OK', customtkinter.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "customtkinter missing in python38 offline tree" }
           & $py -c "import requests, PIL, numpy, psutil; print('core38 OK', psutil.__version__)"
@@ -280,7 +320,6 @@ jobs:
           $sum = (Get-ChildItem $offline -Recurse -File -EA SilentlyContinue | Measure-Object Length -Sum).Sum
           Write-Host ("py38 offline bytes={0:N0}" -f $sum)
           if ($sum -lt 8MB) { throw "win7 tree too small" }
-
 
       - name: Offline Argos Translate packs
         shell: pwsh
@@ -332,13 +371,11 @@ jobs:
           $outDir = Join-Path $PWD "installer\Output"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-          # Run makensis with NSI path; relative File paths resolve from NSI directory
           & $env:MAKENSIS /V3 $nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed code=$LASTEXITCODE" }
 
           $exe = Get-ChildItem $outDir -Filter "GGUF-Runner-Setup-*.exe" | Select-Object -First 1
           if (-not $exe) { throw "No Setup EXE in installer\Output" }
-          # Offline payload should make EXE large; 20MB minimum sanity
           if ($exe.Length -lt 20MB) {
             Write-Host "WARN Setup size=$($exe.Length) — may be missing heavy payload"
           }
