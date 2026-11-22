@@ -325,26 +325,35 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+
+          # ---- Python 3.11 (Win10/11) — primary target for Argos ----
           $py = Join-Path $PWD "installer\payload\python-offline-amd64\python.exe"
-          if (-not (Test-Path $py)) { Write-Host "no py311 offline"; exit 0 }
-          & $py -m pip install argostranslate --no-warn-script-location
-          if ($LASTEXITCODE -ne 0) { Write-Host "WARN argostranslate pip failed"; exit 0 }
-          & $py scripts\download_argos_packages.py
-          if ($LASTEXITCODE -ne 0) { Write-Host "WARN argos pack download incomplete (some languages missing is OK)" }
-          $packDir = Join-Path $PWD "profiles\argos_packages"
-          foreach ($tree in @(
-            "installer\payload\python-offline-amd64",
-            "installer\payload\python-offline-win7-amd64"
-          )) {
-            $dst = Join-Path $PWD $tree
-            if (Test-Path $dst) {
-              & (Join-Path $dst "python.exe") -m pip install argostranslate --no-warn-script-location
-              $ad = Join-Path $dst "argos_packages"
+          if (Test-Path $py) {
+            & $py -m pip install argostranslate --no-warn-script-location
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "WARN argostranslate pip failed on py311"
+            } else {
+              & $py scripts\download_argos_packages.py
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "WARN argos pack download incomplete (some languages missing is OK)"
+              }
+              $packDir = Join-Path $PWD "profiles\argos_packages"
+              $ad = Join-Path $PWD "installer\payload\python-offline-amd64\argos_packages"
               New-Item -ItemType Directory -Force -Path $ad | Out-Null
-              if (Test-Path $packDir) { Copy-Item -Force (Join-Path $packDir "*.argosmodel") $ad -EA SilentlyContinue }
+              if (Test-Path $packDir) {
+                Copy-Item -Force (Join-Path $packDir "*.argosmodel") $ad -EA SilentlyContinue
+              }
             }
+          } else {
+            Write-Host "no py311 offline — skipping Argos"
           }
-          Write-Host "Argos offline step finished"
+
+          # ---- Python 3.8 (Win7) — spacy has no cp38 wheels on PyPI ----
+          # Argos is intentionally NOT installed into the Win7 tree because
+          # spacy/thinc/cymem have no cp38 wheels on PyPI (source build requires Cython
+          # + MSVC, which is not available in a bare embeddable Python).
+          # Win7 users fall back to text-only mode; translation is available on Win10/11.
+          Write-Host "Argos offline step finished (Win7 tree intentionally skipped)"
 
       - name: Install NSIS
         shell: pwsh
