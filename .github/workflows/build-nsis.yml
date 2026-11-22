@@ -337,12 +337,6 @@ jobs:
               if ($LASTEXITCODE -ne 0) {
                 Write-Host "WARN argos pack download incomplete (some languages missing is OK)"
               }
-              $packDir = Join-Path $PWD "profiles\argos_packages"
-              $ad = Join-Path $PWD "installer\payload\python-offline-amd64\argos_packages"
-              New-Item -ItemType Directory -Force -Path $ad | Out-Null
-              if (Test-Path $packDir) {
-                Copy-Item -Force (Join-Path $packDir "*.argosmodel") $ad -EA SilentlyContinue
-              }
             }
           } else {
             Write-Host "no py311 offline — skipping Argos"
@@ -350,10 +344,34 @@ jobs:
 
           # ---- Python 3.8 (Win7) — spacy has no cp38 wheels on PyPI ----
           # Argos is intentionally NOT installed into the Win7 tree because
-          # spacy/thinc/cymem have no cp38 wheels on PyPI (source build requires Cython
-          # + MSVC, which is not available in a bare embeddable Python).
-          # Win7 users fall back to text-only mode; translation is available on Win10/11.
+          # spacy/thinc/cymem have no cp38 wheels on PyPI.
           Write-Host "Argos offline step finished (Win7 tree intentionally skipped)"
+
+          # ---- Keep packs OUT of the NSIS payload to stay under the 2GB NSIS limit ----
+          # profiles\argos_packages is the single source of truth; Setup.nsi copies
+          # only a small subset (see PRUNE list in Compile NSIS). Full pack set is
+          # uploaded as a separate artifact.
+          $packDir = Join-Path $PWD "profiles\argos_packages"
+          if (Test-Path $packDir) {
+            $totalMB = [math]::Round(((Get-ChildItem $packDir -Filter "*.argosmodel" | Measure-Object Length -Sum).Sum / 1MB), 1)
+            Write-Host "argos_packages total size = $totalMB MB (kept out of NSIS payload)"
+            Get-ChildItem $packDir -Filter "*.argosmodel" | ForEach-Object {
+              Write-Host ("  {0}  {1:N1} MB" -f $_.Name, ($_.Length / 1MB))
+            }
+          }
+
+          # Remove any argos_packages dirs that may have been injected into the
+          # offline Python trees by earlier runs — they blow NSIS past the 2GB limit.
+          foreach ($tree in @(
+            "installer\payload\python-offline-amd64\argos_packages",
+            "installer\payload\python-offline-win7-amd64\argos_packages"
+          )) {
+            $p = Join-Path $PWD $tree
+            if (Test-Path $p) {
+              Remove-Item -Recurse -Force $p
+              Write-Host "removed $tree from NSIS payload"
+            }
+          }
 
       - name: Install NSIS
         shell: pwsh
@@ -375,6 +393,21 @@ jobs:
           $ErrorActionPreference = "Stop"
           $py311 = Join-Path $PWD "installer\payload\python-offline-amd64\python.exe"
           if (-not (Test-Path $py311)) { throw "Missing offline Python 3.11 payload — cannot build offline Setup" }
+
+          # --- Prune argos models to keep NSIS < 2GB limit ---
+          # Set $keep to the language pairs you want bundled. Adjust as needed.
+          $packDir = Join-Path $PWD "profiles\argos_packages"
+          if (Test-Path $packDir) {
+            $keep = @("en_fa.argosmodel", "fa_en.argosmodel", "en_ar.argosmodel", "ar_en.argosmodel")
+            Get-ChildItem $packDir -Filter "*.argosmodel" | ForEach-Object {
+              if ($keep -notcontains $_.Name) {
+                Remove-Item -Force $_.FullName
+                Write-Host "pruned $($_.Name)"
+              }
+            }
+            $totalMB = [math]::Round(((Get-ChildItem $packDir -Filter "*.argosmodel" | Measure-Object Length -Sum).Sum / 1MB), 1)
+            Write-Host "argos_packages kept size = $totalMB MB"
+          }
 
           $nsi = Join-Path $PWD "installer\GGUF-Runner.nsi"
           $outDir = Join-Path $PWD "installer\Output"
